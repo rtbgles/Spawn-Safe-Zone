@@ -1,0 +1,7 @@
+"AddonInfo"
+{
+	"name"		"Boggle Safe Zone"
+	"version"	"1.2.3"
+	"author"	"Boggle"
+	"info"		"Admin two-corner AABB. No dying or killing inside."
+}
