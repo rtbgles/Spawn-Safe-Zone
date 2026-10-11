@@ -20,24 +20,14 @@ if CLIENT then
     language.Add( "tool.boggle_safezone.left", "Click opposite corners of the box" )
     language.Add( "tool.boggle_safezone.right", "Cancel first corner, or remove a zone" )
     language.Add( "tool.boggle_safezone.reload", "Apply current options to the zone under the cursor" )
-    language.Add( "Cleanup_boggle_safezone", "Boggle Safe Zones" )
 end
 
 local function canPlace( ply )
     return IsValid( ply ) and ply:IsAdmin()
 end
 
-local function zoneAt( pos )
-    if not BoggleSafe then
-        return nil
-    end
-    local inside = BoggleSafe.FindAt and BoggleSafe.FindAt( pos )
-    if IsValid( inside ) then
-        return inside
-    end
-    if BoggleSafe.Nearest then
-        return BoggleSafe.Nearest( pos, 48 )
-    end
+local function zoneAt( pos, reach )
+    return BoggleSafe.FindAt( pos ) or BoggleSafe.Nearest( pos, reach )
 end
 
 local function makeBounds( a, b, height )
@@ -86,36 +76,26 @@ function TOOL:LeftClick( trace )
 
     local height = math.Clamp( self:GetClientNumber( "height", 192 ), 32, 2048 )
     local mins, maxs = makeBounds( a, b, height )
-    local outgoing = self:GetClientNumber( "outgoing", 1 ) >= 1
-    local npcs = self:GetClientNumber( "npcs", 0 ) >= 1
-
-    local zone = ents.Create( "ent_boggle_safezone" )
+    local zone = BoggleSafe.CreateZone( mins, maxs, {
+        outgoing = self:GetClientNumber( "outgoing", 1 ) >= 1,
+        npcs = self:GetClientNumber( "npcs", 0 ) >= 1,
+        persist = self:GetClientNumber( "persist", 1 ) >= 1
+    } )
     if not IsValid( zone ) then
         return false
     end
-    zone:SetPos( ( mins + maxs ) * 0.5 )
-    zone:Spawn()
-    zone:ApplyCorners( mins, maxs )
-    zone:SetBlockOutgoing( outgoing )
-    zone:SetProtectNPCs( npcs )
-    zone:SetPersist( self:GetClientNumber( "persist", 1 ) >= 1 )
-    if BoggleSafe and BoggleSafe.Invalidate then
-        BoggleSafe.Invalidate()
-    end
-    if BoggleSafe and BoggleSafe.Remember then
-        BoggleSafe.Remember( zone )
-    end
 
+    -- Undo forgets the zone before removing it. There's deliberately no cleanup entry:
+    -- cleanup removes entities without telling us, so the zone would come back on restart.
     undo.Create( "Boggle Safe Zone" )
-        undo.AddEntity( zone )
         undo.AddFunction( function()
-            if IsValid( zone ) and BoggleSafe and BoggleSafe.Forget then
-                BoggleSafe.Forget( zone )
-            end
+            BoggleSafe.Forget( zone )
         end )
+        undo.AddEntity( zone )
         undo.SetPlayer( ply )
     undo.Finish()
-    ply:AddCleanup( "boggle_safezone", zone )
+
+    ply:ChatPrint( string.format( "[Safe Zone] Zone #%d created%s.", zone:EntIndex(), zone:GetPersist() and " and saved" or " (not saved)" ) )
     return true
 end
 
@@ -135,17 +115,13 @@ function TOOL:RightClick( trace )
     end
 
     local origin = ( trace and trace.HitPos ) or ply:GetPos()
-    local zone = zoneAt( origin )
-    if not IsValid( zone ) and BoggleSafe and BoggleSafe.Nearest then
-        zone = BoggleSafe.Nearest( origin, 80 )
-    end
+    local zone = zoneAt( origin, 80 )
     if not IsValid( zone ) then
         return false
     end
 
-    if BoggleSafe and BoggleSafe.Forget then
-        BoggleSafe.Forget( zone )
-    end
+    ply:ChatPrint( string.format( "[Safe Zone] Zone #%d removed.", zone:EntIndex() ) )
+    BoggleSafe.Forget( zone )
     zone:Remove()
     return true
 end
@@ -160,23 +136,16 @@ function TOOL:Reload( trace )
     end
 
     local origin = ( trace and trace.HitPos ) or ply:GetPos()
-    local zone = zoneAt( origin )
-    if not IsValid( zone ) and BoggleSafe and BoggleSafe.Nearest then
-        zone = BoggleSafe.Nearest( origin, 256 )
-    end
+    local zone = zoneAt( origin, 256 )
     if not IsValid( zone ) then
         return false
     end
 
     zone:SetBlockOutgoing( self:GetClientNumber( "outgoing", 1 ) >= 1 )
     zone:SetProtectNPCs( self:GetClientNumber( "npcs", 0 ) >= 1 )
-    if zone.SetPersist then
-        zone:SetPersist( self:GetClientNumber( "persist", 1 ) >= 1 )
-    end
-    if BoggleSafe and BoggleSafe.Remember then
-        BoggleSafe.Remember( zone )
-    end
-    ply:ChatPrint( "[Safe Zone] Options applied and saved." )
+    zone:SetPersist( self:GetClientNumber( "persist", 1 ) >= 1 )
+    BoggleSafe.Remember( zone )
+    ply:ChatPrint( string.format( "[Safe Zone] Options applied to zone #%d%s.", zone:EntIndex(), zone:GetPersist() and " and saved" or " (not saved)" ) )
     return true
 end
 
@@ -193,16 +162,12 @@ if CLIENT then
     local ghostA = Color( 220, 220, 80, 180 )
     local ghostBox = Color( 90, 220, 110, 60 )
 
-    hook.Add( "PostDrawTranslucentRenderables", "BoggleSafe_Ghost", function()
+    hook.Add( "PostDrawTranslucentRenderables", "BoggleSafe_Ghost", function( _, skybox )
+        if skybox then
+            return
+        end
         local ply = LocalPlayer()
-        if not IsValid( ply ) then
-            return
-        end
-        local wep = ply:GetActiveWeapon()
-        if not IsValid( wep ) or wep:GetClass() ~= "gmod_tool" then
-            return
-        end
-        if ply:GetInfo( "gmod_toolmode" ) ~= "boggle_safezone" then
+        if not BoggleSafe.IsEditing( ply ) then
             return
         end
 
@@ -227,12 +192,11 @@ if CLIENT then
 
     function TOOL.BuildCPanel( panel )
         panel:Help( "Left click two opposite corners. If both clicks are on the floor, Height is added upward so the box actually covers players." )
-        panel:NumSlider( "Floor height", "boggle_safezone_height", 32, 1024, 0 )
+        panel:NumSlider( "Floor height", "boggle_safezone_height", 32, 2048, 0 )
         panel:CheckBox( "Block outgoing damage (players and NPCs)", "boggle_safezone_outgoing" )
         panel:CheckBox( "Also protect NPCs standing in the box", "boggle_safezone_npcs" )
         panel:CheckBox( "Persist after restart and cleanup", "boggle_safezone_persist" )
-        panel:ControlHelp( "Reload on an existing zone applies these checkboxes to it and writes DATA/boggle_safezone/<map>.json." )
+        panel:ControlHelp( "Reload on an existing zone applies these checkboxes to it and writes data/boggle_safezone/<map>.json." )
+        panel:Help( "Zones are visible while you hold this tool (yellow = outgoing damage allowed). Right click removes the zone you're aiming at; undo also works. Map cleanup does not remove saved zones." )
     end
 end
-
-cleanup.Register( "boggle_safezone" )
